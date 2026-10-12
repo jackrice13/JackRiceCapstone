@@ -10,14 +10,17 @@ capstone project. It does three things, one after another:
   3. Builds a simple summary report, one row per endpoint per tool,
      and writes it to a CSV file you can open in Excel
 
-IMPORTANT - read this before running it for real:
-Since I (Claude) can't test this against your actual Action1/Cloudflare/
-Nessus accounts, the *connection and login* code is confirmed correct
-from each tool's official documentation, but the exact field names used
-to summarize each endpoint's status (like "is this patched?") are my
-best guess based on typical API shapes. The raw JSON files this script
-saves will show us the real structure, so we can fix any mismatched
-field names together after your first run.
+How endpoints are matched to each tool's data:
+  - Action1:    by IP address (searched anywhere in the record), or by
+                hostname if the IP isn't found
+  - Cloudflare: by hostname (Cloudflare lists devices by computer name)
+  - Nessus:     by IP address (Nessus lists hosts by the address scanned)
+
+Note: the connection and login code is confirmed against each tool's
+documentation and has now run successfully against your live Action1 and
+Cloudflare accounts. The "found yes/no" matching is the simplest possible
+check. Richer status fields (is it patched? when was it last seen?) come
+from the raw_*.json files and get added to the report as the next step.
 
 Usage:
     1. Copy .env.example to .env and fill in your real credentials
@@ -45,29 +48,51 @@ def save_raw(tool_name, data, output_dir):
     print(f"  Saved raw {tool_name} data -> {path}")
 
 
-def find_by_ip(items, ip, possible_ip_keys):
+def value_has_ip(value, ip):
     """
-    Looks through a list of dicts for one whose IP address (under any of
-    several possible field names) matches the given IP. Returns None if
-    nothing matches, rather than crashing.
+    Returns True if `value` is, or contains, exactly this IP address.
+
+    We don't know in advance which field name a tool uses for its IP
+    address ("address"? "ip"? "ip_address"?), so instead of guessing, this
+    looks through every value in the record. It handles three shapes:
+      - a plain string, e.g. "10.0.2.50"
+      - several addresses in one string, e.g. "10.0.2.50, fe80::1"
+      - a dict or list that has the address somewhere inside it
+    It compares whole addresses only, so "10.0.2.5" will NOT match
+    "10.0.2.50".
     """
+    if isinstance(value, str):
+        # Turn commas and semicolons into spaces, then split into pieces.
+        pieces = value.replace(",", " ").replace(";", " ").split()
+        return ip in pieces
+    if isinstance(value, dict):
+        return any(value_has_ip(v, ip) for v in value.values())
+    if isinstance(value, list):
+        return any(value_has_ip(v, ip) for v in value)
+    return False  # numbers, True/False, None can't be an IP address
+
+
+def find_by_ip(items, ip):
+    """Returns the first record that contains this IP anywhere, else None."""
     for item in items:
-        for key in possible_ip_keys:
-            if item.get(key) == ip:
-                return item
+        if value_has_ip(item, ip):
+            return item
     return None
 
 
-def find_by_name_fragment(items, name, possible_name_keys):
+def find_by_hostname(items, hostname, possible_name_keys):
     """
-    Same idea as find_by_ip, but matches loosely on name (since Cloudflare
-    devices are identified by device/user name, not local IP address).
+    Returns the first record whose name field equals this hostname (ignoring
+    upper/lower case), else None. If we don't know the hostname yet
+    (hostname is None) there is nothing to compare, so it returns None.
     """
-    name_lower = name.lower().replace(" ", "")
+    if not hostname:
+        return None
+    target = hostname.lower()
     for item in items:
         for key in possible_name_keys:
             value = item.get(key)
-            if value and name_lower in str(value).lower().replace(" ", ""):
+            if value and str(value).lower() == target:
                 return item
     return None
 
@@ -91,10 +116,20 @@ def main():
     print("Pulling Action1 data...")
     try:
         action1_data = action1_client.get_all_endpoint_data(
-            config.ACTION1_CLIENT_ID, config.ACTION1_CLIENT_SECRET
+            config.ACTION1_BASE_URL,
+            config.ACTION1_CLIENT_ID,
+            config.ACTION1_CLIENT_SECRET,
         )
         save_raw("action1", action1_data, output_dir)
-        print(f"  Got {len(action1_data)} endpoint(s) from Action1.\n")
+        print(f"  Got {len(action1_data)} endpoint(s) from Action1.")
+        # Diagnostic: field names and computer names are not sensitive, and
+        # seeing them lets us fill in the hostnames in config.py.
+        if action1_data:
+            print(f"  Action1 fields: {sorted(action1_data[0].keys())}")
+            print("  Action1 endpoint name -> address:")
+            for e in action1_data:
+                print(f"    {e.get('name')} -> {e.get('address')}")
+            print()
     except Exception as e:
         print(f"  Action1 FAILED: {e}\n")
 
@@ -104,11 +139,14 @@ def main():
             config.CLOUDFLARE_API_TOKEN, config.CLOUDFLARE_ACCOUNT_ID
         )
         save_raw("cloudflare", cloudflare_data, output_dir)
-        print(f"  Got {len(cloudflare_data)} device(s) from Cloudflare.\n")
+        print(f"  Got {len(cloudflare_data)} device(s) from Cloudflare.")
+        print(f"  Cloudflare device names: {[d.get('name') for d in cloudflare_data]}\n")
     except Exception as e:
         print(f"  Cloudflare FAILED: {e}\n")
 
-    print("Pulling Nessus data...")
+    # Printing the (non-secret) address makes it obvious if .env isn't being
+    # read the way you expect. Never print the API keys.
+    print(f"Pulling Nessus data from {config.NESSUS_HOST} ...")
     try:
         nessus_data = nessus_client.get_latest_scan_results(
             config.NESSUS_HOST, config.NESSUS_ACCESS_KEY, config.NESSUS_SECRET_KEY
@@ -123,13 +161,17 @@ def main():
     # and write one summary row per (endpoint, tool) combination.
     # ------------------------------------------------------------------
     report_rows = []
+    found_table = []  # one entry per endpoint, used for the printout at the end
 
     for endpoint in config.ENDPOINTS:
         name = endpoint["name"]
         ip = endpoint["ip"]
+        hostname = endpoint.get("hostname")
 
-        # --- Action1 match (by IP - try a few likely field names) ---
-        a1_match = find_by_ip(action1_data, ip, ["ip_address", "ip", "ipAddress"])
+        # --- Action1: IP anywhere in the record, else fall back to hostname ---
+        a1_match = find_by_ip(action1_data, ip)
+        if a1_match is None:
+            a1_match = find_by_hostname(action1_data, hostname, ["name", "hostname"])
         report_rows.append({
             "endpoint": name,
             "ip": ip,
@@ -139,8 +181,8 @@ def main():
             "raw_snippet": json.dumps(a1_match)[:200] if a1_match else "",
         })
 
-        # --- Cloudflare match (by name, since device IP isn't the same concept) ---
-        cf_match = find_by_name_fragment(cloudflare_data, name, ["name", "user", "device_name"])
+        # --- Cloudflare: by hostname (devices are listed by computer name) ---
+        cf_match = find_by_hostname(cloudflare_data, hostname, ["name"])
         report_rows.append({
             "endpoint": name,
             "ip": ip,
@@ -150,7 +192,7 @@ def main():
             "raw_snippet": json.dumps(cf_match)[:200] if cf_match else "",
         })
 
-        # --- Nessus match (by hostname/IP) ---
+        # --- Nessus: by hostname/IP (Nessus lists hosts by the address scanned) ---
         n_match = None
         for host_result in nessus_data:
             if host_result.get("hostname") == ip:
@@ -162,8 +204,15 @@ def main():
             "tool": "Nessus",
             "nist_csf": ", ".join(NIST_CSF_MAPPING["nessus"]),
             "found": "yes" if n_match else "no",
-            "raw_snippet": json.dumps(n_match.get("raw_summary")) [:200] if n_match else "",
+            "raw_snippet": json.dumps(n_match.get("raw_summary"))[:200] if n_match else "",
         })
+
+        found_table.append((
+            name,
+            "yes" if a1_match else "no",
+            "yes" if cf_match else "no",
+            "yes" if n_match else "no",
+        ))
 
     # ------------------------------------------------------------------
     # Step 3: Write the summary to a CSV file
@@ -175,6 +224,12 @@ def main():
         )
         writer.writeheader()
         writer.writerows(report_rows)
+
+    # A quick on-screen version of the same information.
+    print("Did each tool see each endpoint?")
+    print(f"  {'Endpoint':<22}{'Action1':<10}{'Cloudflare':<12}{'Nessus':<8}")
+    for row in found_table:
+        print(f"  {row[0]:<22}{row[1]:<10}{row[2]:<12}{row[3]:<8}")
 
     print(f"\nDone. Summary report written to: {csv_path}")
     print("Open the raw_*.json files in the same folder to see full detail per tool.")

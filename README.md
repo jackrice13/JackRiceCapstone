@@ -21,6 +21,21 @@ Sophos is not wired up yet - add it once that trial account exists.
    Action1, Cloudflare, and Nessus (see the comments in that file for
    exactly where to find each one in each tool's console).
 
+### Action1 region (important)
+
+Action1 runs a separate copy of its service per world region, and your
+Client ID and Secret only work on the copy where your account lives.
+This project's account is on **na-2**, so `.env` should contain:
+
+```
+ACTION1_BASE_URL=https://app.na-2.action1.com/api/3.0
+```
+
+If you leave that line out, the code falls back to the na-2 address. A
+wrong region produces a `401 Unauthorized` even when the credentials are
+correct. To find yours, look at the address bar while logged into the
+Action1 console and add `/api/3.0` to the end.
+
 ## Double-check before your first run
 
 Open `config.py` and confirm the `ENDPOINTS` list matches your actual

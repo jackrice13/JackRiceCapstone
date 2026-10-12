@@ -27,6 +27,12 @@ import urllib3
 # for this local self-signed instance.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# How long to wait before giving up, in seconds: (time to connect, time to
+# wait for a reply). Without this, Python waits forever if the connection
+# opens but the server never answers (the "stall" you saw earlier), and the
+# program just looks frozen. With it, you get a clear error after a while.
+NESSUS_TIMEOUT = (10, 60)
+
 
 def _headers(access_key, secret_key):
     return {
@@ -38,7 +44,7 @@ def _headers(access_key, secret_key):
 def list_scans(host, access_key, secret_key):
     """Returns every scan (past and present) configured in this Nessus instance."""
     url = f"{host}/scans"
-    response = requests.get(url, headers=_headers(access_key, secret_key), verify=False)
+    response = requests.get(url, headers=_headers(access_key, secret_key), verify=False, timeout=NESSUS_TIMEOUT)
     response.raise_for_status()
     return response.json()["scans"] or []
 
@@ -49,7 +55,7 @@ def get_scan_details(host, access_key, secret_key, scan_id):
     covered and a summary vulnerability count per host.
     """
     url = f"{host}/scans/{scan_id}"
-    response = requests.get(url, headers=_headers(access_key, secret_key), verify=False)
+    response = requests.get(url, headers=_headers(access_key, secret_key), verify=False, timeout=NESSUS_TIMEOUT)
     response.raise_for_status()
     return response.json()
 
@@ -57,7 +63,7 @@ def get_scan_details(host, access_key, secret_key, scan_id):
 def get_host_details(host, access_key, secret_key, scan_id, host_id):
     """Returns the detailed vulnerability findings for one specific host in a scan."""
     url = f"{host}/scans/{scan_id}/hosts/{host_id}"
-    response = requests.get(url, headers=_headers(access_key, secret_key), verify=False)
+    response = requests.get(url, headers=_headers(access_key, secret_key), verify=False, timeout=NESSUS_TIMEOUT)
     response.raise_for_status()
     return response.json()
 
