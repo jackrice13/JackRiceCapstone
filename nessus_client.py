@@ -107,6 +107,7 @@ def get_latest_results_per_host(host, access_key, secret_key):
                 "hostname": hostname,
                 "scan_name": scan.get("name"),
                 "scan_id": scan_id,
+                "scan_last_modified": scan.get("last_modification_date"),  # seconds since 1970
                 "raw_summary": h,          # the summary row Nessus shows in its host list
                 "raw_detail": host_detail,  # the full per-host vulnerability breakdown
             }

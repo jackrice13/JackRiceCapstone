@@ -7,8 +7,10 @@ capstone project. It does three things, one after another:
   1. Pulls current data from Action1, Cloudflare, and Nessus
   2. Saves the raw (unprocessed) API responses to disk, so you can see
      exactly what each tool actually returned
-  3. Builds a simple summary report, one row per endpoint per tool,
-     and writes it to a CSV file you can open in Excel
+  3. Judges each endpoint's data (PASS / WARN / FAIL, using the rules in
+     assessment.py) and writes the results to CSV files you can open in
+     Excel: a detailed one (one row per endpoint per tool, with evidence)
+     and a compact one (one row per endpoint)
 
 How endpoints are matched to each tool's data:
   - Action1:    by IP address (searched anywhere in the record), or by
@@ -31,10 +33,11 @@ Usage:
 import csv
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import config
 import action1_client
+import assessment
 import cloudflare_client
 import nessus_client
 from nist_mapping import NIST_CSF_MAPPING
@@ -118,6 +121,48 @@ def find_nessus_host(nessus_data, ip, hostname):
     return None
 
 
+def print_compliance_peek(action1_data, cloudflare_data, nessus_data):
+    """
+    Prints a short preview of the compliance-related fields from each tool,
+    so we can see what real values look like before building the report
+    columns. Only the fields listed below are shown on purpose. The raw
+    records also contain things like usernames, serial numbers, MAC and
+    public IP addresses, which should not be pasted into a chat.
+    """
+    def short(value):
+        # Turn any value into text and cut it off at 200 characters.
+        return json.dumps(value, default=str)[:200]
+
+    action1_fields = [
+        "name", "online_status", "status", "last_seen", "update_status",
+        "missing_updates", "vulnerability_status", "vulnerabilities",
+        "reboot_required", "OS",
+    ]
+    cloudflare_fields = [
+        "name", "last_seen_at", "client_version", "os_version",
+        "device_type", "active_registrations",
+    ]
+
+    print("Compliance data preview (what the report will be built from):")
+
+    print("  Action1:")
+    for e in action1_data:
+        print(f"    {e.get('name')}")
+        for field in action1_fields[1:]:
+            print(f"      {field}: {short(e.get(field))}")
+
+    print("  Cloudflare:")
+    for d in cloudflare_data:
+        print(f"    {d.get('name')}")
+        for field in cloudflare_fields[1:]:
+            print(f"      {field}: {short(d.get(field))}")
+
+    print("  Nessus (the summary row for each host):")
+    for r in nessus_data:
+        print(f"    {r.get('hostname')}: {short(r.get('raw_summary'))}")
+    print()
+
+
 def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = f"ccm_report_{timestamp}"
@@ -182,78 +227,100 @@ def main():
     except Exception as e:
         print(f"  Nessus FAILED: {e}\n")
 
+    print_compliance_peek(action1_data, cloudflare_data, nessus_data)
+
     # ------------------------------------------------------------------
     # Step 2: Match each tool's data back to your known testbed endpoints
     # and write one summary row per (endpoint, tool) combination.
     # ------------------------------------------------------------------
     report_rows = []
-    found_table = []  # one entry per endpoint, used for the printout at the end
+    status_table = []  # one entry per endpoint, used for the printout at the end
+
+    now = datetime.now(timezone.utc)  # one timestamp for the whole run, in UTC
 
     for endpoint in config.ENDPOINTS:
         name = endpoint["name"]
         ip = endpoint["ip"]
         hostname = endpoint.get("hostname")
 
-        # --- Action1: IP anywhere in the record, else fall back to hostname ---
+        # Find this endpoint's record in each tool's data.
+        # Action1: IP anywhere in the record, else fall back to hostname
         a1_match = find_by_ip(action1_data, ip)
         if a1_match is None:
             a1_match = find_by_hostname(action1_data, hostname, ["name", "hostname"])
-        report_rows.append({
-            "endpoint": name,
-            "ip": ip,
-            "tool": "Action1",
-            "nist_csf": ", ".join(NIST_CSF_MAPPING["action1"]),
-            "found": "yes" if a1_match else "no",
-            "raw_snippet": json.dumps(a1_match)[:200] if a1_match else "",
-        })
-
-        # --- Cloudflare: by hostname (devices are listed by computer name) ---
+        # Cloudflare: by hostname (devices are listed by computer name)
         cf_match = find_by_hostname(cloudflare_data, hostname, ["name"])
-        report_rows.append({
-            "endpoint": name,
-            "ip": ip,
-            "tool": "Cloudflare",
-            "nist_csf": ", ".join(NIST_CSF_MAPPING["cloudflare"]),
-            "found": "yes" if cf_match else "no",
-            "raw_snippet": json.dumps(cf_match)[:200] if cf_match else "",
-        })
-
-        # --- Nessus: by the address/name that was scanned (IP or hostname) ---
+        # Nessus: by the address/name that was scanned (IP or hostname)
         n_match = find_nessus_host(nessus_data, ip, hostname)
-        report_rows.append({
-            "endpoint": name,
-            "ip": ip,
-            "tool": "Nessus",
-            "nist_csf": ", ".join(NIST_CSF_MAPPING["nessus"]),
-            "found": "yes" if n_match else "no",
-            "raw_snippet": json.dumps(n_match.get("raw_summary"))[:200] if n_match else "",
-        })
 
-        found_table.append((
-            name,
-            "yes" if a1_match else "no",
-            "yes" if cf_match else "no",
-            "yes" if n_match else "no",
-        ))
+        # (label, key used in config.py and nist_mapping.py, matched record,
+        #  the function in assessment.py that judges that tool's data)
+        tools = [
+            ("Action1", "action1", a1_match, assessment.assess_action1),
+            ("Cloudflare", "cloudflare", cf_match, assessment.assess_cloudflare),
+            ("Nessus", "nessus", n_match, assessment.assess_nessus),
+        ]
+
+        statuses = {}
+        for label, key, match, judge in tools:
+            if match is None:
+                verdict = assessment.assess_missing(name, key, label, config.EXPECTED_GAPS)
+            else:
+                verdict = judge(match, now, config.STALE_AFTER_MINUTES[key])
+            statuses[label] = verdict["status"]
+
+            last_seen = verdict["last_seen"]
+            age = assessment.minutes_between(last_seen, now)
+            report_rows.append({
+                "endpoint": name,
+                "ip": ip,
+                "tool": label,
+                "nist_csf": ", ".join(NIST_CSF_MAPPING[key]),
+                "found": "yes" if match is not None else "no",
+                "status": verdict["status"],
+                "evidence": verdict["evidence"],
+                "last_seen_utc": last_seen.strftime("%Y-%m-%d %H:%M:%S") if last_seen else "",
+                "minutes_since_seen": "" if age is None else age,
+                "collected_utc": now.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+
+        status_table.append(
+            (name, statuses["Action1"], statuses["Cloudflare"], statuses["Nessus"])
+        )
 
     # ------------------------------------------------------------------
-    # Step 3: Write the summary to a CSV file
+    # Step 3: Write the results to CSV files
     # ------------------------------------------------------------------
+    # The detailed file: one row per endpoint per tool, with the evidence.
     csv_path = os.path.join(output_dir, "ccm_summary.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(
-            f, fieldnames=["endpoint", "ip", "tool", "nist_csf", "found", "raw_snippet"]
+            f,
+            fieldnames=[
+                "endpoint", "ip", "tool", "nist_csf", "found", "status",
+                "evidence", "last_seen_utc", "minutes_since_seen", "collected_utc",
+            ],
         )
         writer.writeheader()
         writer.writerows(report_rows)
 
-    # A quick on-screen version of the same information.
-    print("Did each tool see each endpoint?")
-    print(f"  {'Endpoint':<22}{'Action1':<10}{'Cloudflare':<12}{'Nessus':<8}")
-    for row in found_table:
-        print(f"  {row[0]:<22}{row[1]:<10}{row[2]:<12}{row[3]:<8}")
+    # The compact file: one row per endpoint, one column per tool.
+    matrix_path = os.path.join(output_dir, "ccm_matrix.csv")
+    with open(matrix_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["endpoint", "Action1", "Cloudflare", "Nessus"])
+        writer.writerows(status_table)
 
-    print(f"\nDone. Summary report written to: {csv_path}")
+    # A quick on-screen version of the compact table.
+    print("Verdict for each endpoint, by tool:")
+    print(f"  {'Endpoint':<22}{'Action1':<12}{'Cloudflare':<12}{'Nessus':<12}")
+    for row in status_table:
+        print(f"  {row[0]:<22}{row[1]:<12}{row[2]:<12}{row[3]:<12}")
+    print("  (PASS / WARN / FAIL = verdict, UNKNOWN = data missing, "
+          "NOT_FOUND = tool has no record, N/A = tool can't run there)")
+
+    print(f"\nDone. Detailed report: {csv_path}")
+    print(f"      Compact table:   {matrix_path}")
     print("Open the raw_*.json files in the same folder to see full detail per tool.")
 
 

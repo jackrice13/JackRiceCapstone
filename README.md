@@ -38,11 +38,13 @@ Action1 console and add `/api/3.0` to the end.
 
 ## Double-check before your first run
 
-Open `config.py` and confirm the `ENDPOINTS` list matches your actual
-testbed IPs - especially the **Domain Controller's IP**, which was marked
-with a "confirm this is right" comment since we never pinned it down
-directly in our setup conversation. Run `ipconfig` on the DC and update
-that line if it's wrong.
+Open `config.py` and confirm the `ENDPOINTS` list matches your testbed:
+each endpoint's IP address and its real computer name (`hostname`). The
+Domain Controller is currently `10.0.2.3`, as Action1 reports it. Run
+`ipconfig` on any machine to confirm its address.
+
+Nessus is reached over the VirtualBox Host-Only network, so `.env` should
+contain `NESSUS_HOST=https://192.168.56.52:8834`.
 
 ## Running it
 
@@ -53,28 +55,58 @@ python main.py
 This will:
 - Log into each tool and pull current data
 - Save the raw (unprocessed) API response from each tool into a new
-  timestamped folder, e.g. `ccm_report_20260927_143000/`
-- Build a summary CSV (`ccm_summary.csv`) in that same folder, showing
-  whether each endpoint was found in each tool's data
+  timestamped folder, e.g. `ccm_report_20261012_155053/`
+- Judge each endpoint's data and write two CSV files in that folder:
+  - `ccm_summary.csv`: one row per endpoint per tool, with the verdict,
+    the evidence behind it, the NIST CSF subcategories, and how long ago
+    the tool last saw the endpoint
+  - `ccm_matrix.csv`: one row per endpoint, one column per tool (the
+    compact table, handy for pasting into a paper)
+
+## How a verdict is decided
+
+The rules live in `assessment.py`. Thresholds live in `config.py`.
+
+| Tool | NIST CSF | FAIL | WARN | PASS |
+|---|---|---|---|---|
+| Action1 | PR.MA | Critical updates or critical vulnerabilities found | Other updates or vulnerabilities, reboot pending, agent not connected, or stale data | None of those |
+| Cloudflare | PR.AC | No active registration | Not seen recently (stale) | Registered and seen recently |
+| Nessus | ID.RA, PR.IP | Any critical or high finding | Medium findings, or the scan is stale | Only low or informational findings |
+
+Other values you may see:
+
+| Value | Meaning |
+|---|---|
+| UNKNOWN | The tool returned the endpoint but not the fields needed to judge it |
+| NOT_FOUND | The tool has no record of the endpoint at all (worth investigating) |
+| N/A | The tool cannot be installed there (listed in `EXPECTED_GAPS` in `config.py`) |
+
+These rules are judgement calls. Keep them consistent with the pass/fail
+criteria in your methodology section, and change them in one place if the
+methodology changes.
 
 ## If something looks wrong
 
-If the summary CSV shows "no" for an endpoint you know is actually
-enrolled, open the matching `raw_<tool>.json` file in that same output
-folder and look at the actual field names Python got back - the
-matching logic in `main.py` (the `find_by_ip` / `find_by_name_fragment`
-functions) is a best guess at what those fields are called, since it
-was written without being able to test live against your real accounts.
-Share what the raw JSON actually looks like and the matching logic can
-be adjusted to fit.
+- **An endpoint shows NOT_FOUND:** check that its `ip` and `hostname` in
+  `config.py` are right. Action1 is matched by IP anywhere in the record,
+  falling back to hostname. Cloudflare is matched by hostname. Nessus is
+  matched by the address or name that was scanned.
+- **A Nessus row shows UNKNOWN:** the severity counts were in a format the
+  code did not recognize. Open `raw_nessus.json` and look at the
+  `raw_summary` for that host.
+- **Many rows WARN with "STALE":** the data is older than the limit set in
+  `STALE_AFTER_MINUTES`. Re-run the scan or wait for the agent to check in.
+- **Disk full or other errors:** each tool is pulled separately, so one
+  failure does not stop the others. Read the "FAILED" line for that tool.
 
 ## Files
 
 | File | What it does |
 |---|---|
-| `config.py` | Loads credentials from `.env`, defines your known endpoints |
+| `config.py` | Loads credentials from `.env`; defines endpoints, stale limits, and expected gaps |
 | `action1_client.py` | Talks to the Action1 API |
 | `cloudflare_client.py` | Talks to the Cloudflare Zero Trust API |
 | `nessus_client.py` | Talks to your local Nessus instance |
 | `nist_mapping.py` | Which NIST CSF subcategories each tool covers |
+| `assessment.py` | The PASS / WARN / FAIL rules |
 | `main.py` | Runs everything and builds the report |
