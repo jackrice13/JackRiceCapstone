@@ -97,6 +97,27 @@ def find_by_hostname(items, hostname, possible_name_keys):
     return None
 
 
+def find_nessus_host(nessus_data, ip, hostname):
+    """
+    Nessus lists each host exactly as it was typed into the scan's target
+    list: usually an IP like "10.0.2.51", but sometimes a name like
+    "linuxws" or "linuxws.lab.local". So this accepts either form.
+    """
+    for result in nessus_data:
+        listed = result.get("hostname")
+        if not listed:
+            continue
+        if listed == ip:
+            return result
+        if hostname:
+            # Compare only the part before the first dot, ignoring case, so
+            # "LinuxWS.lab.local" still matches "linuxws". (An IP such as
+            # "10.0.2.51" becomes "10", which won't equal a real hostname.)
+            if listed.split(".")[0].lower() == hostname.lower():
+                return result
+    return None
+
+
 def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = f"ccm_report_{timestamp}"
@@ -148,11 +169,16 @@ def main():
     # read the way you expect. Never print the API keys.
     print(f"Pulling Nessus data from {config.NESSUS_HOST} ...")
     try:
-        nessus_data = nessus_client.get_latest_scan_results(
+        nessus_data = nessus_client.get_latest_results_per_host(
             config.NESSUS_HOST, config.NESSUS_ACCESS_KEY, config.NESSUS_SECRET_KEY
         )
         save_raw("nessus", nessus_data, output_dir)
-        print(f"  Got {len(nessus_data)} host result(s) from Nessus.\n")
+        print(f"  Got {len(nessus_data)} host result(s) from Nessus.")
+        # Diagnostic: which hosts Nessus knows about and which scan each came from.
+        print("  Nessus host -> scan it came from:")
+        for r in nessus_data:
+            print(f"    {r.get('hostname')} -> {r.get('scan_name')}")
+        print()
     except Exception as e:
         print(f"  Nessus FAILED: {e}\n")
 
@@ -192,12 +218,8 @@ def main():
             "raw_snippet": json.dumps(cf_match)[:200] if cf_match else "",
         })
 
-        # --- Nessus: by hostname/IP (Nessus lists hosts by the address scanned) ---
-        n_match = None
-        for host_result in nessus_data:
-            if host_result.get("hostname") == ip:
-                n_match = host_result
-                break
+        # --- Nessus: by the address/name that was scanned (IP or hostname) ---
+        n_match = find_nessus_host(nessus_data, ip, hostname)
         report_rows.append({
             "endpoint": name,
             "ip": ip,

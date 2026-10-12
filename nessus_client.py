@@ -68,11 +68,17 @@ def get_host_details(host, access_key, secret_key, scan_id, host_id):
     return response.json()
 
 
-def get_latest_scan_results(host, access_key, secret_key):
+def get_latest_results_per_host(host, access_key, secret_key):
     """
-    Convenience function: finds the most recently completed scan and
-    pulls full per-host detail for every host in it. This is what your
-    main CCM tool will actually call.
+    Convenience function that your main CCM tool calls. For every host that
+    appears in ANY completed scan, it returns that host's result from the
+    NEWEST scan it appeared in.
+
+    Why not just use the single newest scan? Because a lab often has several
+    scans (for example one per group of machines). If we only read the newest
+    one, every machine scanned separately would look like it was never
+    assessed, which is wrong. Continuous monitoring cares about "what is the
+    latest known state of each machine".
     """
     scans = list_scans(host, access_key, secret_key)
 
@@ -82,23 +88,27 @@ def get_latest_scan_results(host, access_key, secret_key):
             "No completed Nessus scans found. Run a scan first, then re-run this tool."
         )
 
-    # Most recently modified completed scan
-    latest = max(completed_scans, key=lambda s: s.get("last_modification_date", 0))
-    scan_id = latest["id"]
+    # Newest scan first. A host we have already seen in a newer scan is
+    # skipped in older scans, which also saves API calls.
+    completed_scans.sort(key=lambda s: s.get("last_modification_date", 0), reverse=True)
 
-    details = get_scan_details(host, access_key, secret_key, scan_id)
-    hosts = details.get("hosts", [])
+    newest_by_host = {}  # hostname/IP as Nessus lists it -> that host's result
+    for scan in completed_scans:
+        scan_id = scan["id"]
+        details = get_scan_details(host, access_key, secret_key, scan_id)
 
-    results = []
-    for h in hosts:
-        host_detail = get_host_details(host, access_key, secret_key, scan_id, h["host_id"])
-        results.append(
-            {
-                "hostname": h.get("hostname"),
-                "scan_name": latest.get("name"),
+        # "or []" protects against a scan that has no hosts (Nessus sends null)
+        for h in details.get("hosts") or []:
+            hostname = h.get("hostname")
+            if hostname in newest_by_host:
+                continue
+            host_detail = get_host_details(host, access_key, secret_key, scan_id, h["host_id"])
+            newest_by_host[hostname] = {
+                "hostname": hostname,
+                "scan_name": scan.get("name"),
+                "scan_id": scan_id,
                 "raw_summary": h,          # the summary row Nessus shows in its host list
                 "raw_detail": host_detail,  # the full per-host vulnerability breakdown
             }
-        )
 
-    return results
+    return list(newest_by_host.values())
